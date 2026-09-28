@@ -46,7 +46,13 @@ module centipede(
 		 input	[5:0]	hs_address,
 		 input	[7:0]	hs_data_in,
 		 output	[7:0]	hs_data_out,
-		 input			hs_write
+		 input			hs_write,
+
+		 // RetroAchievements tap: CPU writes to the RAMs FinalBurn Neo exposes
+		 // as "All Ram", with their offset in that block (clk_12mhz domain)
+		 output reg        ra_we,
+		 output reg [11:0] ra_addr,
+		 output reg  [7:0] ra_din
 	);
 
 	 //
@@ -865,6 +871,23 @@ module centipede(
 				.dout_b(pfd),
 				.ce_b(pf_ce4_n)
 				);
+
+	// RetroAchievements tap. FinalBurn Neo's Centipede driver (d_millipede.cpp)
+	// exposes the MemIndex concatenation as "All Ram":
+	//     0x000 Drv6502RAM   0x400  CPU 0000-03FF
+	//     0x400 DrvVidRAM    0x400  CPU 0400-07BF (address & 0x3FF; 0x7C0-0x7FF never written)
+	//     0x800 DrvSpriteRAM 0x040  CPU 07C0-07FF
+	//     0x840 DrvPalRAM    0x020  CPU 1400-140F (address & 0xF; 0x850-0x85F never written)
+	// Every strobe below is the one the RAM itself samples (s_6mhz, write_n),
+	// held while phi2 is high: the mirror just rewrites the same byte.
+	always @(posedge clk_12mhz) begin
+		ra_we   <= s_6mhz & ~write_n & (~ram0_n | ~pf_n | (~coloram_n & ab[8:4] == 5'd0));
+		ra_din  <= db_out;
+		ra_addr <= ~ram0_n             ? { 2'b00, ab[9:0] } :
+		           ~pf_n & &ab[9:6]    ? { 6'b100000, ab[5:0] } :
+		           ~pf_n               ? { 2'b01, ab[9:0] } :
+		                                 { 8'h84, ab[3:0] };
+	end
 
 	// EAROM (top 3 high scores)
 	reg [5:0]   earom_addr;

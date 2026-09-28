@@ -203,7 +203,7 @@ assign VIDEO_ARY = (!ar) ? (status[2]  ? 8'd15 : 8'd16) : 12'd0;
 
 `include "build_id.v"
 localparam CONF_STR = {
-	"A.CENTIPED;;",
+	"RA_CENTIPED;;",
 	"H0OJK,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"H0O2,Orientation,Vert,Horz;",
 	"O35,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
@@ -373,7 +373,24 @@ wire no_rotate = status[2] | direct_video ;
 wire rotate_ccw = 1;
 wire flip = 0;
 
-screen_rotate screen_rotate (.*);
+// The rotation framebuffer shares the DDR port with the RetroAchievements
+// mirror (see below), so its DDRAM outputs go through the RA mux.
+wire  [7:0] rot_burstcnt, rot_be;
+wire [28:0] rot_addr;
+wire [63:0] rot_din;
+wire        rot_we, rot_rd;
+
+screen_rotate screen_rotate
+(
+	.*,
+	.DDRAM_CLK(),
+	.DDRAM_BURSTCNT(rot_burstcnt),
+	.DDRAM_ADDR(rot_addr),
+	.DDRAM_DIN(rot_din),
+	.DDRAM_BE(rot_be),
+	.DDRAM_WE(rot_we),
+	.DDRAM_RD(rot_rd)
+);
 
 arcade_video #(256,9,1) arcade_video
 (
@@ -441,9 +458,17 @@ centipede uut(
 	.hs_address(ioctl_download ? ioctl_addr[5:0] : hs_address),
 	.hs_data_out(hs_data_out),
 	.hs_data_in(ioctl_dout),
-	.hs_write(ioctl_wr & nvram_download)
+	.hs_write(ioctl_wr & nvram_download),
 
+	.ra_we(ra_tap_we),
+	.ra_addr(ra_tap_addr),
+	.ra_din(ra_tap_din)
 );
+
+// RetroAchievements tap (see RETROACHIEVEMENTS below)
+wire        ra_tap_we;
+wire [11:0] ra_tap_addr;
+wire  [7:0] ra_tap_din;
 
 // HISCORE SYSTEM
 // --------------
@@ -464,5 +489,70 @@ nvram #(
 	.nvram_data_out(hs_data_out),
 	.pause_cpu(hs_pause)
 );
+
+///////////////////   RETROACHIEVEMENTS   //////////////////
+//
+// RAM mirror for the RetroAchievements fork of Main_MiSTer
+// (centipede_ra_mirror.v, from jotego's jtframe via the RA jtcores fork). RA
+// arcade sets are written against FinalBurn Neo, whose Centipede driver
+// (d_millipede.cpp) exposes the MemIndex concatenation as "All Ram" (0x860
+// bytes: 6502 RAM, playfield, sprite RAM, colour RAM; see the tap in
+// centipede.v). The 6502 is 8-bit: shadow byte k is RA address k, and the ARM
+// region table is the identity {0, 0x860, 0}. The EAROM (high scores) is not
+// part of FBNeo's "All Ram".
+//
+// The only other DDR client is the screen rotation framebuffer, which runs on
+// CLK_VIDEO (clk_24), ignores DDRAM_BUSY and writes one pixel per CE_PIXEL while
+// VGA_DE is high. So the mirror is clocked by clk_24 too (its shadow is written
+// from clk_sys = clk_12 through dual-clock BRAM, same PLL), and it only starts
+// a copy once VGA_DE has been low for 4096 clocks (170 us, longer than any
+// HBlank): the copy (512 qwords, ~25 us) then runs in VBlank and the
+// framebuffer never loses a write. Held off during ROM download.
+
+reg [1:0] ra_rst_s, ra_vbl_s, ra_dl_s;
+always @(posedge clk_24) begin
+	ra_rst_s <= { ra_rst_s[0], reset };
+	ra_vbl_s <= { ra_vbl_s[0], vblank };
+	ra_dl_s  <= { ra_dl_s[0],  ioctl_download };
+end
+
+reg [11:0] ra_de_idle;
+always @(posedge clk_24) begin
+	if (VGA_DE) ra_de_idle <= 0;
+	else if (~&ra_de_idle) ra_de_idle <= ra_de_idle + 1'd1;
+end
+
+wire  [7:0] ra_burstcnt, ra_be;
+wire [28:0] ra_addr;
+wire [63:0] ra_din;
+wire        ra_we, ra_active;
+
+centipede_ra_mirror #(.AW(12)) ra_mirror
+(
+	.rst(ra_rst_s[1]),
+	.clk(clk_24),
+	.lvbl(~ra_vbl_s[1]),
+	.hold(ra_dl_s[1]),
+	.start_ok(&ra_de_idle),
+	.wr_clk(clk_sys),
+	.wr_word({ 4'd0, ra_tap_addr[11:1] }),
+	.wr_din({ 2{ra_tap_din} }),
+	.wr_be(~ra_tap_we ? 2'b00 : ra_tap_addr[0] ? 2'b10 : 2'b01),
+	.active(ra_active),
+	.ddr_busy(DDRAM_BUSY),
+	.ddr_burstcnt(ra_burstcnt),
+	.ddr_addr(ra_addr),
+	.ddr_we(ra_we),
+	.ddr_be(ra_be),
+	.ddr_din(ra_din)
+);
+
+assign DDRAM_CLK      = clk_24;
+assign DDRAM_BURSTCNT = ra_active ? ra_burstcnt : rot_burstcnt;
+assign DDRAM_ADDR     = ra_active ? ra_addr     : rot_addr;
+assign DDRAM_DIN      = ra_active ? ra_din      : rot_din;
+assign DDRAM_BE       = ra_active ? ra_be       : rot_be;
+assign DDRAM_WE       = ra_active ? ra_we       : rot_we;
+assign DDRAM_RD       = ra_active ? 1'b0        : rot_rd;
 
 endmodule
